@@ -5,23 +5,31 @@ import matplotlib.pyplot as plt
 import glob
 import os
 import argparse
+from tqdm import tqdm
+import PIL.Image
+import io
 import plotly
+from scipy.spatial.transform import Rotation
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 from mpl_toolkits import mplot3d
 import json
 import re
 import tqdm
-import cv2
 import pandas as pd
+import cv2
 import math
 pd.options.mode.chained_assignment = None  # default='warn'
+from scipy import interpolate
+from scipy import signal
 
 parser = argparse.ArgumentParser(description='Preprocess and visualize the trajectory in real world')
 parser.add_argument('--dataset_path', type=str, help='Specify path to dataset')
 parser.add_argument('--process_trial_index', dest='process_trial_index', help='Process trial at given idx only', default=None)
 parser.add_argument('--output_path', type=str, help='Specify output path to save dataset')
 parser.add_argument('--unit', dest='unit', help='Scaling unit', required=True, type=str)
+parser.add_argument('--scale', dest='scale', help='Scale the uv-coordinates', action='store_true')
+parser.add_argument('--no_scale', dest='scale', help='Scale the uv-coordinates', action='store_false')
 args = parser.parse_args()
 
 def get_savepath(output_path, dataset_folder):
@@ -33,32 +41,131 @@ def get_savepath(output_path, dataset_folder):
       os.makedirs(output_path)
   return output_path
 
-def get_depth(traj_df, cam_dict):
+def get_depth(trajectory_df, cam_params):
   '''
   This function will return the points in camera space and screen space
   - This projectionMatrix use in unity screen convention : (0, 0) is in the bottom-left
   '''
-  worldToCameraMatrix = np.array(cam_dict['E_unity'])
-  projectionMatrix = np.array(cam_dict['P_unity'])
+  worldToCameraMatrix = np.array(cam_params['Extrinsic_unity'])
+  projectionMatrix = np.array(cam_params['projectionMatrix_unity'])
   # Plane space
-  world_space = np.hstack((traj_df[['ball_plane_x', 'ball_plane_y', 'ball_plane_z']].values, np.ones(traj_df.shape[0]).reshape(-1, 1)))
+  world_space = np.hstack((trajectory_df[['ball_plane_x', 'ball_plane_y', 'ball_plane_z']].values, np.ones(trajectory_df.shape[0]).reshape(-1, 1)))
   # Uncomment this to test the particular points
+  # world_space = np.array([[0, 0, 0, 1],
+                          # [-21.2, 0.1, 0, 1],
+                          # [-21.2, 0.1, 33, 1],
+                          # [2, 0, 33, 1],
+                          # [23.5, 0, 33, 1],
+                          # [-20.5, 0, -11.1, 1],
+                          # [-22.9, 0, 39.6, 1]])
   # WorldToCameraMatrix : Plane space -> Camera space (u*depth, v*depth, depth, 1)
   # In the unity depth is in the +z direction, so we need to negate the z direction that came from multiplied with extrinsic
   camera_space = world_space @ worldToCameraMatrix.T
-  traj_df['ball_camera_x'] = camera_space[:, 0]
-  traj_df['ball_camera_y'] = camera_space[:, 1]
+  trajectory_df['ball_camera_x'] = camera_space[:, 0]
+  trajectory_df['ball_camera_y'] = camera_space[:, 1]
+  # trajectory_df['ball_camera_depth'] = -camera_space[:, 2]
   # projectionMatrix : Camera space -> NDC Space
   # In the unity, projection matrix didn't give the output as the screen space but it will in the NDC space(We'll see the world in range(-1, 1))
   # Then we need to unnormalized it to ge the screen space
   ndc_space = camera_space @ projectionMatrix.T
-  traj_df['ball_camera_depth'] = ndc_space[:, 2]
+  trajectory_df['ball_camera_depth'] = ndc_space[:, 2]
   # Get the screen coordinates
-  u = ((ndc_space[:, 0]/ndc_space[:, 2]) + 1) * (cam_dict['w']/2)
-  v = ((ndc_space[:, 1]/ndc_space[:, 2]) + 1) * (cam_dict['h']/2)
-  traj_df['ball_screen_unity_u_project'] = u
-  traj_df['ball_screen_unity_v_project'] = v
-  return traj_df
+  u = ((ndc_space[:, 0]/ndc_space[:, 2]) + 1) * (camera_properties_dict['w']/2)
+  v = ((ndc_space[:, 1]/ndc_space[:, 2]) + 1) * (camera_properties_dict['h']/2)
+  trajectory_df['ball_screen_unity_u_project'] = u
+  trajectory_df['ball_screen_unity_v_project'] = v
+  return trajectory_df
+
+def proj_unproj_verify(trajectory_df, cam_params):
+  '''
+  Trying to proj_unproj_verify the point by given the (u, v and depth) -> world coordinates
+  - This projectionMatrix use in unity screen convention : (0, 0) is in the bottom-left
+  '''
+  #print("#" * 100)
+  #print("[###] proj_unproj_verifyion to verify the projection-proj_unproj_verifyion, transformation matrix")
+  eps = np.finfo(float).eps
+  # Get the projectionMatrix
+  projectionMatrix = np.array(cam_params['projectionMatrix_unity'])
+  # Get the camera Extrinsic
+  worldToCameraMatrix = np.array(cam_params['Extrinsic_unity'])
+  cameraToWorldMatrix = np.linalg.inv(worldToCameraMatrix)
+  # The (u, v and depth) from the get_depth() function
+  depth = trajectory_df['ball_camera_depth'].values.reshape(-1, 1)
+  u_unity = trajectory_df['ball_screen_unity_u_project'].values.reshape(-1, 1)
+  v_unity = trajectory_df['ball_screen_unity_v_project'].values.reshape(-1, 1)
+
+  # The screen space will be : (u*depth, v*depth, depth, 1)
+  screen_space = np.hstack((np.multiply(u_unity, depth), np.multiply(v_unity, depth), depth, np.ones(u_unity.shape)))
+  #print("PARAMS SHAPE : ", projectionMatrix.shape, worldToCameraMatrix.shape)
+  #print("DATA SHAPE : ", screen_space.shape, depth.shape, u_unity.shape, v_unity.shape)
+
+  '''
+  PROJECTION
+  X, Y, Z (MOCAP) ===> U, V (UNITY)
+  [#####] Note : Multiply the X, Y, Z point by scaling factor that use in opengl visualization because the obtained u, v came from the scaled => Scaling = 10
+  [#####] Note : Don't multiply if use the perspective projection matrix from intrinsic
+  '''
+
+  print('='*40 + 'Projection checking...' + '='*40)
+  # Get the world coordinates : (X, Y, Z, 1)
+  world_space = np.hstack((trajectory_df[['ball_plane_x', 'ball_plane_y', 'ball_plane_z']], np.ones(trajectory_df.shape[0]).reshape(-1, 1)))
+  # worldToCameraMatrix : World space -> Camera space (u*depth, v*depth, depth, 1)
+  camera_space = world_space @ worldToCameraMatrix.T
+  # projectionMatrix : Camera space -> NDC space (u and v) in range(-1, 1)
+  ndc_space = camera_space @ projectionMatrix.T
+  ndc_space[:, :-1] /= ndc_space[:, 2].reshape(-1, 1)
+  # Get the Screen space from unnormalized the NDC space
+  screen_space = ndc_space.copy()
+  # We need to subtract the camera_properties_dict['w'] out of the ndc_space since the Extrinisc is inverse from the unity. So this will make x-axis swapped and need to subtract it to get the same 3D reconstructed points : 
+  screen_space[:, 0] = ((ndc_space[:, 0]) + 1) * (camera_properties_dict['w']/2)
+  screen_space[:, 1] = ((ndc_space[:, 1]) + 1) * (camera_properties_dict['h']/2)
+  # The answer should be : True, True
+  #print("[#] Equality check of screen space (u, v) with projection : ", np.all(np.isclose(screen_space[:, 0].reshape(-1, 1), u_unity)), ", ", np.all(np.isclose(screen_space[:, 1].reshape(-1, 1), v_unity)))
+
+  '''
+  UNPROJECTION
+  U, V, Depth (UNITY) ===> X, Y, Z (UNITY)
+  '''
+  # Target value
+  target_camera_space = np.hstack((trajectory_df['ball_camera_x'].values.reshape(-1, 1), trajectory_df['ball_camera_y'].values.reshape(-1, 1), depth))
+  target_world_space = np.hstack((trajectory_df['ball_plane_x'].values.reshape(-1, 1), trajectory_df['ball_plane_y'].values.reshape(-1, 1),
+                                  trajectory_df['ball_plane_z'].values.reshape(-1, 1)))
+
+  # [Screen, Depth] -> Plane
+  # Following the proj_unproj_verifyion by inverse the projectionMatrix and inverse of arucoPlaneToCameraMatrix(here's cameraToWorldMatrix)
+  # Normalizae the Screen space to NDC space
+  # SCREEN -> NDC
+  screen_space[:, 0] /= camera_properties_dict['w']
+  screen_space[:, 1] /= camera_properties_dict['h']
+  ndc_space = screen_space.copy()
+  ndc_space = (ndc_space * 2) - 1
+
+  # NDC space -> CAMERA space (u*depth, v*depth, depth, 1)
+  ndc_space = np.hstack((np.multiply(ndc_space[:, 0].reshape(-1, 1), depth), 
+                        np.multiply(ndc_space[:, 1].reshape(-1, 1), depth), 
+                        depth, 
+                        np.ones(ndc_space.shape[0]).reshape(-1, 1)))
+
+  projectionMatrix_inv = np.linalg.inv(projectionMatrix)
+  camera_space =  ndc_space @ projectionMatrix_inv.T
+  # CAMERA space -> Plane space
+  world_space =  camera_space @ cameraToWorldMatrix.T
+  # Store the plane proj_unproj_verify to dataframe
+  trajectory_df.loc[:, 'ball_plane_x_unity'] = world_space[:, 0]
+  trajectory_df.loc[:, 'ball_plane_y_unity'] = world_space[:, 1]
+  trajectory_df.loc[:, 'ball_plane_z_unity'] = world_space[:, 2]
+  #print('='*40 + 'proj_unproj_verifyion checking...' + '='*40)
+  #print('Screen : {}\nCamera : {}\nPlane : {}'.format(screen_space[0].reshape(-1), target_camera_space[0].reshape(-1), target_world_space[0].reshape(-1)))
+  #print('\n[#]===> Target Camera proj_unproj_verifyion : ', target_camera_space[0].reshape(-1))
+  #print('Screen -> Camera (By projectionMatrix) : ', camera_space[0].reshape(-1))
+  #print('[Screen, depth] : ', camera_space[0].reshape(-1))
+  #print('\n[#]===> Target Plane proj_unproj_verifyion : ', target_world_space[3])
+  #print('Screen -> Plane (By inverse the projectionMatrix) : ', world_space[3])
+  #print("[#] Equality check of world space (x, y, z) : ", np.all(np.isclose(world_space[:, 0].reshape(-1, 1), trajectory_df['ball_plane_x'].values.reshape(-1, 1))), ", ", np.all(np.isclose(world_space[:, 1].reshape(-1, 1), trajectory_df['ball_plane_y'].values.reshape(-1, 1))), ", ", np.all(np.isclose(world_space[:, 2].reshape(-1, 1), trajectory_df['ball_plane_z'].values.reshape(-1, 1))))
+  #print('='*89)
+
+  # exit()
+  return trajectory_df
 
 # RayCasting
 def cast_ray(uv, I, E):
@@ -117,6 +224,7 @@ def ray_to_plane(E, ray):
   intr_pos = cam_pos + (ray_norm * t)
 
   return intr_pos
+
 
 def get_bound(I, E):
   w = 1664.0
@@ -192,7 +300,7 @@ def load_config_file(folder_name, idx, cam):
   config_file_intrinsic = folder_name + "/motioncapture_camIntrinsic_{}.yml".format(args.unit)
   intrinsic = cv2.FileStorage(config_file_intrinsic, cv2.FILE_STORAGE_READ)
   nodes_extrinsic = [cam, "w", "h"]
-  cam_dict = {}
+  camera_properties_dict = {}
   change_basis_matrix = np.array([[1, 0, 0], [0, 1, 0], [0, 0, -1]])
 
   if args.unit == 'cm':
@@ -204,7 +312,7 @@ def load_config_file(folder_name, idx, cam):
   for each_node in nodes_extrinsic:
     # print("Translation : ", extrinsic.getNode(each_node).mat()[:-1, -1].reshape(-1, 1))
     if each_node == "w" or each_node == "h":
-      cam_dict[each_node] = E_inv.getNode(each_node).real()
+      camera_properties_dict[each_node] = E_inv.getNode(each_node).real()
     elif 'K' in each_node:
       '''
        MOCAP
@@ -222,18 +330,18 @@ def load_config_file(folder_name, idx, cam):
 
       translation = E_inv.getNode(each_node).mat()[:-1, -1].reshape(-1, 1) / scaling
 
-      cam_dict['Inversed_Extrinsic'] = np.concatenate((np.concatenate((rotation_inv, translation), axis=1), np.array([[0, 0, 0, 1]])))
-      cam_dict['Extrinsic'] = np.linalg.inv(cam_dict['Inversed_Extrinsic'].copy())
+      camera_properties_dict['Inversed_Extrinsic'] = np.concatenate((np.concatenate((rotation_inv, translation), axis=1), np.array([[0, 0, 0, 1]])))
+      camera_properties_dict['Extrinsic'] = np.linalg.inv(camera_properties_dict['Inversed_Extrinsic'].copy())
       print("#" * 100)
       print(each_node)
       print("E")
-      for i in range(cam_dict['Extrinsic'].shape[0]):
-        tmp = cam_dict['Extrinsic'][i]
+      for i in range(camera_properties_dict['Extrinsic'].shape[0]):
+        tmp = camera_properties_dict['Extrinsic'][i]
         print("E_inv.SetRow({}, new Vector4({}f, {}f, {}f, {}f));".format(i, tmp[0], tmp[1], tmp[2], tmp[3]))
 
       print("Einv")
-      for i in range(cam_dict['Inversed_Extrinsic'].shape[0]):
-        tmp = cam_dict['Inversed_Extrinsic'][i]
+      for i in range(camera_properties_dict['Inversed_Extrinsic'].shape[0]):
+        tmp = camera_properties_dict['Inversed_Extrinsic'][i]
         print("E_inv.SetRow({}, new Vector4({}f, {}f, {}f, {}f));".format(i, tmp[0], tmp[1], tmp[2], tmp[3]))
 
 
@@ -246,98 +354,115 @@ def load_config_file(folder_name, idx, cam):
   # Then rotation_unity = change_basis_matrix @ change_basis_matrix @ rotation_optitrack @ change_basis_matrix = I @ rotation_optitrack @ change_basis_matrix
   rotation_unity_inv = np.linalg.inv(rotation @ change_basis_matrix)
   translation_unity = np.array([translation[0], translation[1], -translation[2]])
-  cam_dict['Inversed_Extrinsic_unity'] = np.concatenate((np.concatenate((rotation_unity_inv, translation_unity), axis=1), np.array([[0, 0, 0, 1]])))
-  cam_dict['Extrinsic_unity'] = np.linalg.inv(cam_dict['Inversed_Extrinsic_unity'].copy())
+  camera_properties_dict['Inversed_Extrinsic_unity'] = np.concatenate((np.concatenate((rotation_unity_inv, translation_unity), axis=1), np.array([[0, 0, 0, 1]])))
+  camera_properties_dict['Extrinsic_unity'] = np.linalg.inv(camera_properties_dict['Inversed_Extrinsic_unity'].copy())
 
   # Load an intrinsic and convert to projectionMatrix
-  cam_dict["Intrinsic"] = intrinsic.getNode("K").mat()
+  camera_properties_dict["Intrinsic"] = intrinsic.getNode("K").mat()
 
   # Set the projectionMatrix to be the same as unity
   far = 1000
   near = 0.1
-  fx = cam_dict['Intrinsic'][0, 0]
-  fy = cam_dict['Intrinsic'][1, 1]
-  cx = cam_dict['Intrinsic'][0, 2]
-  cy = cam_dict['Intrinsic'][1, 2]
+  fx = camera_properties_dict['Intrinsic'][0, 0]
+  fy = camera_properties_dict['Intrinsic'][1, 1]
+  cx = camera_properties_dict['Intrinsic'][0, 2]
+  cy = camera_properties_dict['Intrinsic'][1, 2]
 
   # Convert the projectionMatrix of real world to unity
-  cam_dict["projectionMatrix"] = np.array([[fx/cx, 0, 0, 0],
+  camera_properties_dict["projectionMatrix"] = np.array([[fx/cx, 0, 0, 0],
                                                          [0, fy/cy, 0, 0],
                                                          [0, 0, -(far+near)/(far-near), -2*(far*near)/(far-near)],
                                                          [0, 0, -1, 0]])
 
-  I_unity = cam_dict['projectionMatrix'].copy()
+  I_unity = camera_properties_dict['projectionMatrix'].copy()
   I_unity[2, :] = I_unity[3, :]
   I_unity[3, :] = np.array([0, 0, 0, 1])
-  cam_dict['projectionMatrix_unity'] = I_unity
+  camera_properties_dict['projectionMatrix_unity'] = I_unity
 
   #print("#" * 100)
   #print("[###] Motion Capture")
-  #print("Extrinsic (WorldToCameraMatrix) : \n", cam_dict['Extrinsic'])
-  #print("Inversed Extrinsic (CameraToWorldMatrix) : \n", cam_dict['Inversed_Extrinsic'])
+  #print("Extrinsic (WorldToCameraMatrix) : \n", camera_properties_dict['Extrinsic'])
+  #print("Inversed Extrinsic (CameraToWorldMatrix) : \n", camera_properties_dict['Inversed_Extrinsic'])
   #print("#" * 100)
   #print("[###] Unity")
-  #print("Unity Extrinsic : \n", cam_dict['Extrinsic_unity'])
-  #print("Unity Inversed_Extrinsic : \n", cam_dict['Inversed_Extrinsic_unity'])
+  #print("Unity Extrinsic : \n", camera_properties_dict['Extrinsic_unity'])
+  #print("Unity Inversed_Extrinsic : \n", camera_properties_dict['Inversed_Extrinsic_unity'])
   #print("#" * 100)
-  #print("Intrinsic : \n", cam_dict['Intrinsic'])
+  #print("Intrinsic : \n", camera_properties_dict['Intrinsic'])
   #print("#" * 100)
-  #print("Projection Matrix : \n", cam_dict['projectionMatrix'])
+  #print("Projection Matrix : \n", camera_properties_dict['projectionMatrix'])
   #print("#" * 100)
 
 
   print("E_unity")
-  for i in range(cam_dict['Extrinsic_unity'].shape[0]):
-    tmp = cam_dict['Extrinsic_unity'][i]
+  for i in range(camera_properties_dict['Extrinsic_unity'].shape[0]):
+    tmp = camera_properties_dict['Extrinsic_unity'][i]
     print("E.SetRow({}, new Vector4({}f, {}f, {}f, {}f));".format(i, tmp[0], tmp[1], tmp[2], tmp[3]))
 
   print("Einv_unity")
-  for i in range(cam_dict['Inversed_Extrinsic_unity'].shape[0]):
-    tmp = cam_dict['Inversed_Extrinsic_unity'][i]
+  for i in range(camera_properties_dict['Inversed_Extrinsic_unity'].shape[0]):
+    tmp = camera_properties_dict['Inversed_Extrinsic_unity'][i]
     print("E.SetRow({}, new Vector4({}f, {}f, {}f, {}f));".format(i, tmp[0], tmp[1], tmp[2], tmp[3]))
 
   print("#" * 100)
-  return cam_dict
+  return camera_properties_dict
 
-def split_trajectory(t_df, cam_dict):
-    '''
-    Seperate the trajectory (ground = 0.025 in y-axis), Remove a short/incomplete trajectory
-    Input :
-        1. t_df : Dataframe of trajectory sequences
-        2. cam_dict : Dictionary contains camera parameters
-    Output : 
-        1. ts_prep : List of preprocessed trajectories
-    '''
-    # Maximum possible size of pitch in unity
-    if args.unit == 'cm':
-        scaling = 100
-    elif args.unit == 'm':
-        scaling = 1
-    ground_threshold = 0.025
-    len_threshold = 150
-    t_split = np.split(t_df, np.where(np.isnan(t_df['ball_plane_x']))[0]) # Split by nan
-    t_split = [t[~np.isnan(t['ball_plane_x'])] for t in t_split if not isinstance(t, np.ndarray)] # Remove NaN entries
-    t_split = [t for t in t_split if not t.empty] # Remove empty DataFrames
-    ground = [np.where((t_split[i]['ball_plane_y'].values < ground_threshold) == True)[0] for i in range(len(t_split))] # Ground position
+def split_trajectory(trajectory_df, camera_properties_dict):
+  '''
+  This function will clean the data by split the trajectory, remove some trajectory that too short(maybe an artifact and
+  make the first and last point start on ground (ground_threshold = 0.025 in y-axis)
+  '''
+  # Maximum possible size of pitch in unity
+  if args.unit == 'cm':
+    scaling = 100
+  elif args.unit == 'm':
+    scaling = 1
+  ground_threshold = 0.025
+  length_threshold = 150
+  # Split by nan
+  trajectory_split = np.split(trajectory_df, np.where(np.isnan(trajectory_df['ball_plane_x']))[0])
+  # removing NaN entries
+  trajectory_split = [each_traj[~np.isnan(each_traj['ball_plane_x'])] for each_traj in trajectory_split if not isinstance(each_traj, np.ndarray)]
+  # removing empty DataFrames
+  trajectory_split = [each_traj for each_traj in trajectory_split if not each_traj.empty]
+  # Remove some dataset that have an start-end artifact
+  ground_annotated = [np.where((trajectory_split[i]['ball_plane_y'].values < ground_threshold) == True)[0] for i in range(len(trajectory_split))]
 
-    ts_prep = []
-    for i, t in enumerate(t_split):
-        if len(ground[i]) <= 2:
-            continue
-        else:
-            t_split[i][['ball_opencv_u', 'ball_opencv_v']] = t_split[i][['ball_opencv_u', 'ball_opencv_v']].astype(float)
-            t_split[i][['ball_plane_x', 'ball_plane_y', 'ball_plane_z']] = t_split[i][['ball_plane_x', 'ball_plane_y', 'ball_plane_z']] * scaling
-            t_split[i] = t_split[i].iloc[ground[i][0]:, :]
-            t_split[i].reset_index(drop=True, inplace=True)
-            # Remove outside/short trajectory
-            if (np.all(t_split[i][['ball_opencv_u', 'ball_opencv_v']] > 1e-16) and 
-                np.all(t_split[i][['ball_opencv_u']] < cam_dict['w']) and 
-                np.all(t_split[i][['ball_opencv_v']] < cam_dict['h']) and 
-                t_split[i].shape[0] >= len_threshold):
-                    ts_prep.append(t_split[i])
+  trajectory_split_clean = []
+  # Add the EOT flag at the last rows
+  print("[###] Preprocessing...")
+  print("Filter the uncompleteness projectile (Remove : start from air, too short, and outside the screen)")
+  for idx in range(len(trajectory_split)):
+    # print("IDX : ", idx, " => length ground_annotated : ", len(ground_annotated[idx]), ", length trajectory : ", len(trajectory_split[idx]))
+    if len(ground_annotated[idx]) <= 2:
+      # Not completely projectile
+      #print("At {} : Not completely projectile ===> Continue...".format(idx))
+      continue
+    else :
+      trajectory_split[idx]['ball_screen_opencv_u'] = trajectory_split[idx]['ball_screen_opencv_u'].astype(float)
+      trajectory_split[idx]['ball_screen_opencv_v'] = trajectory_split[idx]['ball_screen_opencv_v'].astype(float)
+      # Invert the world coordinates to make the same convention
+      trajectory_split[idx]['ball_plane_z'] *= -1
+      if args.scale:
+        # These scale came from possible range in unity divided by possible range at mocap
+        trajectory_split[idx]['ball_plane_x'] = (trajectory_split[idx]['ball_plane_x'] * scaling)
+        trajectory_split[idx]['ball_plane_y'] = (trajectory_split[idx]['ball_plane_y'] * scaling)
+        trajectory_split[idx]['ball_plane_z'] = (trajectory_split[idx]['ball_plane_z'] * scaling)
+      # trajectory_split[idx] = trajectory_split[idx].iloc[ground_annotated[idx][0]:ground_annotated[idx][-1], :]
+      trajectory_split[idx] = trajectory_split[idx].iloc[ground_annotated[idx][0]:, :]
+      trajectory_split[idx].reset_index(drop=True, inplace=True)
 
-    print("Number of all trajectory : ", len(t_split))
-    return ts_prep
+      # Initialize the EOT flag to 0
+      trajectory_split_clean.append(trajectory_split[idx])
+
+  print("Number of all trajectory : ", len(trajectory_split))
+
+  # Remove the point that stay outside the screen and too short(blinking point).
+  trajectory_split_clean = [each_traj for each_traj in trajectory_split_clean if (np.all(each_traj[['ball_screen_opencv_u', 'ball_screen_opencv_v']] > np.finfo(float).eps) and np.all(each_traj[['ball_screen_opencv_u']] < camera_properties_dict['w']) and np.all(each_traj[['ball_screen_opencv_v']] < camera_properties_dict['h']) and each_traj.shape[0] >= length_threshold)]
+
+  print("Number of all trajectory(Inside the screen) : ", len(trajectory_split_clean))
+  print("#" * 100)
+  return trajectory_split_clean
 
 def to_npy(trajectory_df, trajectory_type, cam_params):
   '''
@@ -390,7 +515,7 @@ if __name__ == '__main__':
   print("Trial index : ", trial_index)
 
   # Define columns names following the MocapCameraParameters.cpp
-  col_names = ["frame", "camera_index", "camera_serial", "Time", "ball_opencv_u", "ball_opencv_v", "ball_plane_x", "ball_plane_y", "ball_plane_z"]
+  col_names = ["frame", "camera_index", "camera_serial", "Time", "ball_screen_opencv_u", "ball_screen_opencv_v", "ball_plane_x", "ball_plane_y", "ball_plane_z"]
   cam_list = ['K{}'.format(i) for i in range(1, 10)]
   cam_list.remove('K4')
   # Trajectory type
@@ -401,22 +526,22 @@ if __name__ == '__main__':
     trajectory_df = {}
     fig = make_subplots(rows=2, cols=2, specs=[[{'type':'scatter'}, {'type':'scatter3d'}], [{'type':'scatter'}, {'type':'scatter'}]])
     for c_ in cam_list:
-      cam_dict = load_config_file(folder_name=dataset_folder[i], idx=trial_index[i], cam=c_)
+      camera_properties_dict = load_config_file(folder_name=dataset_folder[i], idx=trial_index[i], cam=c_)
       # Check and read .csv file in the given directory
       for traj_type in trajectory_type:
         if os.path.isfile(dataset_folder[i] + "/{}Trajectory_ball_motioncapture_Trial{}.csv".format(traj_type, trial_index[i])):
           trajectory_df[traj_type] = pd.read_csv(dataset_folder[i] + "/{}Trajectory_ball_motioncapture_Trial{}.csv".format(traj_type, trial_index[i]), names=col_names, delimiter=',')
           # Preprocess by splitting, adding EOT and remove the first incomplete trajectory
-          trajectory_df[traj_type] = split_trajectory(trajectory_df[traj_type], cam_dict)
+          trajectory_df[traj_type] = split_trajectory(trajectory_df[traj_type], camera_properties_dict)
           # Get the depth, screen position in unity
           print("#"*100)
           print("[###] Get depth from XYZ motion capture using Extrinsic (Move to camera space)")
-          trajectory_df[traj_type] = [get_depth(trajectory_df[traj_type][i], cam_dict) for i in range(len(trajectory_df[traj_type]))]
+          trajectory_df[traj_type] = [get_depth(trajectory_df[traj_type][i], camera_properties_dict) for i in range(len(trajectory_df[traj_type]))]
 
       print("Trajectory type in Trial{} : {}".format(trial_index[i], trajectory_df.keys()))
 
       # Cast to npy format
-      trajectory_npy = to_npy(trajectory_df, trajectory_type=trajectory_df.keys(), cam_params=cam_dict)
+      trajectory_npy = to_npy(trajectory_df, trajectory_type=trajectory_df.keys(), cam_params=camera_properties_dict)
       sav_col = ['ball_screen_unity_u_project', 'ball_screen_unity_v_project', 'projectionMatrix_unity', 'Extrinsic_unity', 'ball_plane_x', 'ball_plane_y', 'ball_plane_z']
       # Save the .npy files in shape and formation that ready to use in train/test
       for traj_type in trajectory_df.keys():
@@ -430,7 +555,7 @@ if __name__ == '__main__':
       trajectory_plot = pd.DataFrame(data=trajectory_npy['Mixed'][vis_idx].copy(),
                                     columns=['ball_screen_unity_u_project', 'ball_screen_unity_v_project', 'ball_camera_x', 'ball_camera_y', 'ball_camera_depth', 'ball_plane_x', 'ball_plane_y', 'ball_plane_z', 'Extrinsic_unity', 'projectionMatrix_unity'])
 
-      trajectory_plot = proj_unproj_verify(trajectory_df=trajectory_plot, cam_params=cam_dict)
+      trajectory_plot = proj_unproj_verify(trajectory_df=trajectory_plot, cam_params=camera_properties_dict)
       fig = visualize_trajectory(trajectory_df=trajectory_plot, fig=fig, group=c_)
     fig.show()
     exit()
