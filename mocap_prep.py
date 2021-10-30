@@ -15,6 +15,8 @@ import tqdm
 import cv2
 import pandas as pd
 import math
+import warnings
+warnings.filterwarnings('ignore')
 pd.options.mode.chained_assignment = None  # default='warn'
 
 parser = argparse.ArgumentParser(description='Preprocess and visualize the trajectory in real world')
@@ -29,9 +31,12 @@ def get_savepath(output_path, dataset_folder):
     output_path = dataset_folder
   else:
     output_path = args.output_path
-    if not os.path.exists(output_path):
-      os.makedirs(output_path)
+    init_folder(path=output_path)
   return output_path
+
+def init_folder(path):
+    if not os.path.exists(path):
+      os.makedirs(path)
 
 def get_depth(t_df, cam_dict):
   '''
@@ -216,7 +221,7 @@ def load_config_file(folder_name, idx, cam):
   B = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
 
   if args.unit == 'cm':
-    scaling = 1e-3
+    scaling = 1e-2
   elif args.unit == 'm':
     scaling = 1
 
@@ -246,8 +251,6 @@ def load_config_file(folder_name, idx, cam):
             #    tmp = cam_dict['Inversed_Extrinsic'][i]
             #    print("E_inv.SetRow({}, new Vector4({}f, {}f, {}f, {}f));".format(i, tmp[0], tmp[1], tmp[2], tmp[3]))
 
-
-
   # ========== Change convention (Opengl -> Unity) ==========
   cam_dict['Einv_unity'] = B @ cam_dict['Einv_gl'] @ B
   cam_dict['E_unity'] = np.linalg.inv(cam_dict['Einv_unity'].copy())
@@ -272,7 +275,7 @@ def load_config_file(folder_name, idx, cam):
   #print(cam_dict["K_cv"] @ np.array([0, 0, -1, 1]))
 
   K_unity = cam_dict['K_cv'].copy()
-  K_unity[2, :] = np.array([0, 0, 1, 0])
+  K_unity[2, :] = np.array([0, 0, -1, 0])
   K_unity[3, :] = np.array([0, 0, 0, 1])
   cam_dict['K_unity'] = K_unity
 
@@ -321,7 +324,6 @@ def split_trajectory(t_df, cam_dict):
     t_split = [t[~np.isnan(t['ball_plane_x'])] for t in t_split if not isinstance(t, np.ndarray)] # Remove NaN entries
     t_split = [t for t in t_split if not t.empty] # Remove empty DataFrames
     ground = [np.where((t_split[i]['ball_plane_y'].values < ground_threshold) == True)[0] for i in range(len(t_split))] # Ground position
-
     ts_prep = []
     for i, t in enumerate(t_split):
         if len(ground[i]) <= 2:
@@ -329,7 +331,7 @@ def split_trajectory(t_df, cam_dict):
         else:
             t_split[i][['ball_opencv_u', 'ball_opencv_v']] = t_split[i][['ball_opencv_u', 'ball_opencv_v']].astype(float)
             t_split[i][['ball_plane_x', 'ball_plane_y', 'ball_plane_z']] = t_split[i][['ball_plane_x', 'ball_plane_y', 'ball_plane_z']] * scaling
-            t_split[i] = t_split[i].iloc[ground[i][0]:, :]
+            t_split[i] = t_split[i].iloc[ground[i][0]:ground[i][-1], :]
             t_split[i].reset_index(drop=True, inplace=True)
             # Remove outside/short trajectory
             if (np.all(t_split[i][['ball_opencv_u', 'ball_opencv_v']] > 1e-16) and 
@@ -513,10 +515,13 @@ if __name__ == '__main__':
       trajectory_npy = to_npy(trajectory_df, t_type=trajectory_df.keys(), cam_dict=cam_dict)
       sav_col = ['ball_unity_u_project', 'ball_unity_v_project', 'K_unity', 'E_unity', 'Einv_unity', 'ball_plane_x', 'ball_plane_y', 'ball_plane_z']
       # Save the .npy files in shape and formation that ready to use in train/test
+
+      cam_sep = output_path + "/{}/".format(c_)
+      init_folder(cam_sep)
       for traj_type in trajectory_df.keys():
         print("Preprocessed trajectory shape : ", np.array(trajectory_npy[traj_type]).shape)
         temp_arr = np.array([trajectory_npy[traj_type][i].loc[:, sav_col].values for i in range(len(trajectory_npy[traj_type]))])
-        np.save(file=output_path + "/{}Trajectory_Trial{}_{}.npy".format(traj_type, trial_index[i], c_), arr=temp_arr)
+        np.save(file="{}/{}/{}Trajectory_Trial{}_{}.npy".format(output_path, c_, traj_type, trial_index[i], c_), arr=temp_arr)
 
       # Visualize the trajectory
       vis_idx = np.random.randint(0, len(trajectory_npy['Mixed']))

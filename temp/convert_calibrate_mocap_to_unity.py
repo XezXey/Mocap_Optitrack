@@ -112,6 +112,7 @@ def convert_to_unity_json(folder_name, idx, camera_properties_dict):
   with open(output_path, 'w') as outfile:
     json.dump(calibs_json, outfile)
 
+
 if __name__ == "__main__":
   # List trial in directory
   dataset_folder = sorted(glob.glob(args.dataset_path + "/*/"))
@@ -138,3 +139,4 @@ if __name__ == "__main__":
     camera_properties_dict = load_config_file(folder_name=dataset_folder[i], idx=trial_index[i])
     convert_to_unity_json(folder_name=dataset_folder[i], idx=trial_index[i], camera_properties_dict=camera_properties_dict)
 
+  for 
